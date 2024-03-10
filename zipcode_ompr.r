@@ -28,9 +28,12 @@ rs_zipcodes <- zipcodeR::zip_code_db %>% dplyr::filter(state %in% c('ND','SD','M
 
 #clustering_count <- length(unique(rs_zipcodes$zip4))
 sector_count <- 40
+
+
+#clustering maybe unnecesesary
 clustering_count <- 300
 
-#geocluster zipcodes
+#geocluster zipcodes to generate potential sector centers
 zip_clustering <- scdesign::geocluster_kmeans_kmedoids(locationdf=rs_zipcodes %>% dplyr::select(lng,lat),
                                                        cluster_count = clustering_count,cluster_method='kmeans')
 
@@ -44,9 +47,9 @@ rs_zipcodes_agg <- rs_zipcodes %>%
   
   #test: don't actually grup
   #dplyr::group_by(cluster) %>%
-  #dplyr::group_by(zip4) %>%
-  dplyr::group_by(zipcode) %>%
-  dplyr::summarise(lat=mean(lat),lng=mean(lng),population=sum(population))
+  dplyr::group_by(zip4) %>%
+  #dplyr::group_by(zipcode) %>%
+  dplyr::summarise(lat=sum(lat*population)/sum(population),lng=sum(lng*population)/sum(population),population=sum(population))
 
 #leaflet map
 map <- leaflet(rs_zipcodes_agg) %>% addTiles() %>%
@@ -58,10 +61,13 @@ zipcount <- nrow(rs_zipcodes_agg)
 zipclusterdist <- geosphere::distm(x=cbind(rs_zipcodes_agg$lng,rs_zipcodes_agg$lat),
                                    y=cbind(cluster_centers$lng,cluster_centers$lat)) %>%
   measurements::conv_unit('m','mi')
+
 #zipzipdist <- geosphere::distm(cbind(rs_zipcodes_agg$lng,rs_zipcodes_agg$lat)) %>%
 #  measurements::conv_unit('m','mi')
 
 popn_matrix <- matrix(nrow= zipcount, ncol=clustering_count, data= rs_zipcodes_agg$population,byrow=FALSE)
+
+wtddistance_matrix <- zipclusterdist * popn_matrix
 
 avg_popn <- sum(rs_zipcodes_agg$population)/sector_count
 
@@ -100,8 +106,8 @@ milp_model <- milp_model %>%
 add_constraint(
 sum_expr(ompr::colwise(popn_matrix[ziporigin,i]) * zip_cluster[ziporigin,i], ziporigin=1:zipcount) == sector_popn[i] ) %>%
  # use capacity constraints to keep sector population within +/- x% of average
-   add_constraint( sector_popn[i] <= avg_popn * 1.25 * center_open[i]) %>%
-   add_constraint( sector_popn[i] >= avg_popn * 0.75 * center_open[i])
+   add_constraint( sector_popn[i] <= avg_popn * 1.5 * center_open[i]) %>%
+   add_constraint( sector_popn[i] >= avg_popn * 0.5 * center_open[i])
 
 }
 
@@ -118,15 +124,15 @@ milp_model <- milp_model %>%
   
   #set objective: minimize distance to center
   set_objective(sum_expr( ompr::colwise(
-    array_2d_multiplication_fcn(static_array=zipclusterdist,
+    array_2d_multiplication_fcn(static_array = wtddistance_matrix, #zipclusterdist,
     row_variable=ziporigin,column_variable=clusterdest)) *
       zip_cluster[ziporigin,clusterdest], 
     ziporigin=1:zipcount,clusterdest=1:clustering_count), sense='min')
 
 highs_solver_parameters <- list(mip_rel_gap=.05,log_to_console=TRUE)
 
-milp_model_out <-   milp_model %>% solve_model(highs_optimizer(control=highs_solver_parameters))
-  
+milp_model_out <-  milp_model %>% solve_model(highs_optimizer(control=highs_solver_parameters))
+   
   # ompr::solve_model(with_ROI(solver='symphony',verbosity=1))
 
 soln_out <- get_solution(milp_model_out,zip_zipcenter[ziporigin,zipdest]) %>%
