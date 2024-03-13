@@ -1,183 +1,155 @@
-#template of network model for recruiting
 library(tidyverse)
-library(magrittr)
+library(zipcodeR)
 library(ompr)
 library(ompr.roi)
 library(ompr.highs)
+#library(ROI.plugin.glpk)
+#library(ROI.plugin.symphony)
 library(leaflet)
-library(leaflet.minicharts)
-library(zipcodeR)
-library(geosphere)
-library(measurements)
-library(RColorBrewer)
-library(scdesign)
 
 rm(list=ls())
 gc(T,T,T)
-options(scipen=99999)
+
+options(scipen=9999)
+
+highs_solver_parameters <- list(mip_rel_gap=.05,log_to_console=TRUE)
+
+
 
 array_2d_multiplication_fcn <- function(static_array, row_variable, column_variable){
   vapply(seq_along(static_array), function(k) static_array[
     row_variable[k], column_variable[k]], numeric(1L))  }
 
+sector_zips <- zipcodeR::zip_code_db %>% dplyr::filter(state=='MN')%>%
+  dplyr::select(zipcode,state,lat,lng,population) %>%
+  dplyr::mutate(zip4=substr(zipcode,1,4)
+                ) %>%
+  dplyr::filter(!is.na(lat),!is.na(lng),!is.nan(lat),!is.nan(lng)) %>%
+  dplyr::filter(population>0)
 
-rs_zipcodes <- zipcodeR::zip_code_db %>% dplyr::filter(state %in% c('ND','SD','MN')) %>%
-  dplyr::filter(!is.na(lat), !is.na(lng)) %>%
-  dplyr::select(zipcode,lat,lng,population,population_density,land_area_in_sqmi) %>%
-  dplyr::mutate(zip4 = substr(zipcode,1,4)) 
+#choose level at which to summarize zips: zip5 or zip4
+zips_summarized <- sector_zips %>% 
+  #dplyr::group_by(zip4) %>%
+  dplyr::group_by(zipcode) %>%
+  dplyr::summarise(lat=sum(lat*population)/sum(population),
+                   lng=sum(lng*population)/sum(population),
+                   population=sum(population)) %>%
+  #dplyr::rename(zip=zip4) 
+  dplyr::rename(zip=zipcode)
 
-#clustering_count <- length(unique(rs_zipcodes$zip4))
-sector_count <- 40
+zipcount <- nrow(zips_summarized)
+sector_count <- 30
+bigM <- sum(zips_summarized$population) * 1.1
+avg_sector_popn <- sum(zips_summarized$population)/sector_count
+avg_sector_popn_pct_tolerance <- 0.1
+
+#distance matrix, weighted by population, for objective function
+zip_zip_dist <- geosphere::distm(cbind(zips_summarized$lng,
+                                         zips_summarized$lat)) %>%
+  measurements::conv_unit('m','mi') * 0.0001 #scale down for numeric performance in solver
 
 
-#clustering maybe unnecesesary
-clustering_count <- 300
 
-#geocluster zipcodes to generate potential sector centers
-zip_clustering <- scdesign::geocluster_kmeans_kmedoids(locationdf=rs_zipcodes %>% dplyr::select(lng,lat),
-                                                       cluster_count = clustering_count,cluster_method='kmeans')
-
-
-rs_zipcodes$cluster <- zip_clustering$resultsdf$ClusterNumber
-
-cluster_centers  <- zip_clustering$resultsdf %>% dplyr::distinct(Cluster_Lng,Cluster_Lat) %>%
-  dplyr::rename(lat=Cluster_Lat,lng=Cluster_Lng)
-
-rs_zipcodes_agg <- rs_zipcodes %>%
+mymodel <- ompr::MILPModel() %>%
+  add_variable(zip_zip_assign[orig,dest],orig=1:zipcount,dest=1:zipcount,
+               type='continuous',lb=0) %>%
+  add_variable(zipdest_popn[dest], dest=1:zipcount,type='continuous',lb=0) %>%
+  add_variable(zipdest_open[dest],dest=1:zipcount,type='binary') %>%
   
-  #test: don't actually grup
-  #dplyr::group_by(cluster) %>%
-  dplyr::group_by(zip4) %>%
-  #dplyr::group_by(zipcode) %>%
-  dplyr::summarise(lat=sum(lat*population)/sum(population),lng=sum(lng*population)/sum(population),population=sum(population))
-
-#leaflet map
-map <- leaflet(rs_zipcodes_agg) %>% addTiles() %>%
-  addCircleMarkers(lng=~lng,lat=~lat,radius=2)
-map
-
-zipcount <- nrow(rs_zipcodes_agg)
-
-zipclusterdist <- geosphere::distm(x=cbind(rs_zipcodes_agg$lng,rs_zipcodes_agg$lat),
-                                   y=cbind(cluster_centers$lng,cluster_centers$lat)) %>%
-  measurements::conv_unit('m','mi')
-
-#zipzipdist <- geosphere::distm(cbind(rs_zipcodes_agg$lng,rs_zipcodes_agg$lat)) %>%
-#  measurements::conv_unit('m','mi')
-
-popn_matrix <- matrix(nrow= zipcount, ncol=clustering_count, data= rs_zipcodes_agg$population,byrow=FALSE)
-
-wtddistance_matrix <- zipclusterdist * popn_matrix
-
-avg_popn <- sum(rs_zipcodes_agg$population)/sector_count
-
-#generate potential sector centers
-
-milp_model <- ompr::MILPModel() %>%
-  
-  #add_variable(zip_zipcenter[ziporigin,zipdest],
-  #             ziporigin = 1 :zipcount, zipdest=1:zipcount, type='binary') %>%
-
-  add_variable(zip_cluster[ziporigin,clusterdest],
-               ziporigin = 1 :zipcount, clusterdest=1:clustering_count, type='binary') %>%
-  
-  #open/close for sector centers
-  add_variable(center_open[clusterdest], clusterdest=1:clustering_count,type='binary') %>%
-  #population within each sector
-  
-  add_variable(sector_popn[clusterdest], clusterdest=1:clustering_count,type='continuous',lb=0) %>%
-  
-  #require each zip to be aligned to exactly one center
-  
-  add_constraint(sum_expr(zip_cluster[ziporigin,clusterdest],clusterdest=1:clustering_count)==1, ziporigin=1:zipcount) %>%
-  
-  #force opening with bigM
-  
+#constraint: for each orig zip, sum of population equals population
   add_constraint(
-    sum_expr(zip_cluster[ziporigin,clusterdest],ziporigin = 1:zipcount) <= 
-      9999*center_open[clusterdest], clusterdest=1:clustering_count) %>%
+    sum_expr(zip_zip_assign[orig,dest],dest=1:zipcount) == zips_summarized$population[orig],
+    orig = 1:zipcount) %>%
+
+#constraint: for each dest zip, relate zipdest_popn to sum of assigned popn
+  add_constraint(
+    sum_expr(zip_zip_assign[orig,dest],orig=1:zipcount) == zipdest_popn[dest],
+    dest = 1:zipcount) %>%
+    
+  #constraint: activate zipdest_open if zipdest_popn greater than zero
+  add_constraint(zipdest_popn[dest] <= bigM*zipdest_open[dest], dest=1:zipcount) %>%
   
-  #required number of opens: corresponss to number of recruitesr
-  add_constraint(sum_expr(center_open[clusterdest], clusterdest=1:clustering_count) == sector_count)
+  #constraint: must open exactly sector_count destinations
+  add_constraint(sum_expr(zipdest_open[dest],dest=1:zipcount) == sector_count) %>%
 
-#use constraints to define population for each destination zip
-for(i in 1:clustering_count){
-milp_model <- milp_model %>%
-add_constraint(
-sum_expr(ompr::colwise(popn_matrix[ziporigin,i]) * zip_cluster[ziporigin,i], ziporigin=1:zipcount) == sector_popn[i] ) %>%
- # use capacity constraints to keep sector population within +/- x% of average
-   add_constraint( sector_popn[i] <= avg_popn * 1.5 * center_open[i]) %>%
-   add_constraint( sector_popn[i] >= avg_popn * 0.5 * center_open[i])
+#constraint: if opening sector, constrain popn to between 75% and 125% average
 
-}
-
-
-#add constraints to relate sector to RSS
-#add constraints to relate sector to RSS
-#add constraints to relate sector to RSS
-#add constraints to relate sector to RSS
-#add constraints to relate sector to RSS
-
-
-
-milp_model <- milp_model %>%
+add_constraint(zipdest_popn[dest] >= (1-avg_sector_popn_pct_tolerance) * 
+                 avg_sector_popn * zipdest_open[dest], dest=1:zipcount) %>%
+add_constraint(zipdest_popn[dest] <= (1+avg_sector_popn_pct_tolerance) * 
+                 avg_sector_popn * zipdest_open[dest], dest=1:zipcount) %>%
   
-  #set objective: minimize distance to center
+  
+#objective function: minimize zipzipdist * assigned volume
+
   set_objective(sum_expr( ompr::colwise(
-    array_2d_multiplication_fcn(static_array = wtddistance_matrix, #zipclusterdist,
-    row_variable=ziporigin,column_variable=clusterdest)) *
-      zip_cluster[ziporigin,clusterdest], 
-    ziporigin=1:zipcount,clusterdest=1:clustering_count), sense='min')
+    array_2d_multiplication_fcn(static_array=zip_zip_dist,
+row_variable=orig,column_variable=dest)) *
+  zip_zip_assign[orig,dest], orig=1:zipcount,dest=1:zipcount),sense='min')
 
-highs_solver_parameters <- list(mip_rel_gap=.05,log_to_console=TRUE)
+solve_out <-  mymodel %>% solve_model(highs_optimizer(control=highs_solver_parameters))
 
-milp_model_out <-  milp_model %>% solve_model(highs_optimizer(control=highs_solver_parameters))
-   
-  # ompr::solve_model(with_ROI(solver='symphony',verbosity=1))
 
-soln_out <- get_solution(milp_model_out,zip_zipcenter[ziporigin,zipdest]) %>%
-  dplyr::mutate(value = round(value)) %>%
-  dplyr::filter(value==1) %>%
+ #retrieve solutions
+zip_zip_assign_soln <- get_solution(solve_out , zip_zip_assign[orig,dest]) %>%
+#assign each origin to only a single destination. winner takes all.
+dplyr::filter(value>0) %>%
+dplyr::group_by(orig) %>%
+ dplyr::mutate(pct_popn = value/sum(value),
+               count_dest = length(unique(dest)),
+               total_value = sum(value)
+                ) #%>%
+  #for zips aligned to multiple sectors, randomly select (equal weighting)
+  ##dplyr::arrange(orig,desc(pct_popn)) %>%
+  ##dplyr::mutate(cumpop = cumsum(pct_popn)) %>%
+  #dplyr::mutate(runif = runif(n=1)) %>%
+  #dplyr::mutate(cumpop_gte_runif = cumpop>=runif) %>%
+  #dplyr::filter(cumpop_gte_runif == TRUE) %>%
+  #dplyr::group_by(orig) %>%
+  #dplyr::mutate(orig_rownum = dplyr::row_number()) %>%
+  #dplyr::filter(orig_rownum == 1) %>%
+  #dplyr::select(variable,orig,dest,value=total_value)
+  #dplyr::mutate(highest_pct = pct_popn ==max(pct_popn)) %>%
+  #dplyr::mutate(value_new = total_value * highest_pct) %>%
+  #dplyr::select(variable,orig,dest,value=value_new)
+
+#check by origin to ensure all assigned
+origin_soln <- zip_zip_assign_soln %>% dplyr::group_by(orig )%>%
+  dplyr::summarise(solver_popn=sum(value)) %>%
   dplyr::rowwise() %>%
-  dplyr::mutate(zip4origin = rs_zipcodes_agg$zip4[ziporigin],
-                zip4dest = rs_zipcodes_agg$zip4[zipdest])
+  dplyr::mutate(popn = zips_summarized$population[orig]) %>%
+  dplyr::mutate(absdiff = abs(solver_popn-popn))
+summary(origin_soln$absdiff)
 
-opensoln_out <- get_solution(milp_model_out,zipcenter_open[zipdest]) %>%
-  dplyr::mutate(value = round(value)) %>%
-  dplyr::filter(value==1) %>%
-  dplyr::rowwise() %>%
-  dplyr::mutate(zip4dest = rs_zipcodes_agg$zip4[zipdest])
+dest_soln  <- zip_zip_assign_soln %>% dplyr::group_by(dest )%>%
+  dplyr::summarise(solver_popn=sum(value)) %>%
+  dplyr::filter(solver_popn>0.1) %>%
+  dplyr::mutate(pct = solver_popn / avg_sector_popn)
 
-sectorpopn_out <- get_solution(milp_model_out, sector_popn[zipdest]) %>%
-  dplyr::mutate(value = plyr::round_any(value,1)) %>%
-  dplyr::filter(value>0)
-
-summary(sectorpopn_out$value/avg_popn)
-
-#manually add up population
-popn_df <- soln_out %>% dplyr::left_join(rs_zipcodes_agg %>% dplyr::select(zip4origin=zip4,population)) %>%
-  dplyr::group_by(zip4dest) %>% dplyr::summarise(popn=sum(population))
+#check if any dest_soln are outside the allotted bounds. May happen when
+#reassigning ZIPs to a single destination with winner-takes-all
+summary(dest_soln$pct)
 
 
-summary(popn_df$popn/avg_popn)
+dest_open_soln <- get_solution(solve_out, zipdest_open[dest]) %>%
+  dplyr::mutate(value=round(value)) %>%  dplyr::filter(value==1)
 
+#mapping
 
-sectorzip4 <- unique(soln_out$zip4dest)
-
-
-
-
-colors <- brewer.pal(n=sector_count,"Set1")
-#if not enough colors in the palette, repeat
+colors <- RColorBrewer::brewer.pal(n=sector_count,"Set1")
 colors <- rep_len(colors,sector_count)
-colordf <- cbind.data.frame(zip4center=sectorzip4,colors,stringsAsFactors=FALSE)
+colordf <- cbind.data.frame(dest = 1:sector_count,colors,stringsAsFactors=FALSE)
 
-rs_zipcodes <- rs_zipcodes %>% dplyr::left_join(
-  soln_out %>% dplyr::select(zip4 = zip4origin,zip4center=zip4dest) ) %>%
-  dplyr::left_join(colordf)
-
-
-p2 <- leaflet(rs_zipcodes) %>% 
+zip_df <- zip_zip_assign_soln %>% dplyr::left_join(colordf) %>%
+  dplyr::left_join(zips_summarized %>% 
+                     dplyr::ungroup() %>%
+                     dplyr::mutate(orig = dplyr::row_number())) %>%
+  dplyr::select(orig, zip,lat,lng,population,dest,colors)
+  
+map_ <- leaflet(zip_df) %>% 
   addTiles() %>%
-  addCircles(lng=~lng,lat=~lat,color=~colors,popup=~as.factor(zip4))
-p2
+  addCircles(lng=~lng,lat=~lat,color=~colors,radius=5)
+map_
+
+p1 <- ggplot2::ggplot(data=zip_df,aes(x=lng,y=lat,color=as.factor(dest)))+geom_point() + facet_grid(~dest)
+p1
